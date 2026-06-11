@@ -7,17 +7,23 @@ function App() {
   const [isListening, setIsListening] = useState(false)
   const [isLoading, setIsLoading] = useState(false)
   const [selectedScenario, setSelectedScenario] = useState('vc')
-  const [availableVoices, setAvailableVoices] = useState([]) // TRACK 1 FIX: Stores system voice assets
+  const [availableVoices, setAvailableVoices] = useState([]) 
   const [selectedVoice, setSelectedVoice] = useState(null)
   const [uploadedFile, setUploadedFile] = useState(null)
   const [fileContent, setFileContent] = useState('')
   const [evaluation, setEvaluation] = useState(null)
   const [isEvaluating, setIsEvaluating] = useState(false)
   const [isResetting, setIsResetting] = useState(false)
-  
+
   const chatEndRef = useRef(null)
   const recognitionRef = useRef(null)
   const fileInputRef = useRef(null)
+  const messagesRef = useRef([])
+  
+  const scenarioRef = useRef(selectedScenario)
+  const fileContentRef = useRef(fileContent)
+  // ⚡ FIX 1: Shield voice selection from stale handler closures
+  const selectedVoiceRef = useRef(selectedVoice)
 
   const scenarios = {
     vc: { name: 'Venture Capital', label: 'Institutional Investor', color: 'from-emerald-500 to-teal-500' },
@@ -30,19 +36,36 @@ function App() {
     chatEndRef.current?.scrollIntoView({ behavior: 'smooth' })
   }, [messages])
 
-  // TRACK 1 FIX: Load and populate available voices array dynamically
+  useEffect(() => {
+    messagesRef.current = messages
+  }, [messages])
+
+  useEffect(() => {
+    scenarioRef.current = selectedScenario
+  }, [selectedScenario])
+
+  useEffect(() => {
+    fileContentRef.current = fileContent
+  }, [fileContent])
+
+  // ⚡ FIX 1: Keep the voice reference up to date on user changes
+  useEffect(() => {
+    selectedVoiceRef.current = selectedVoice
+  }, [selectedVoice])
+
   useEffect(() => {
     const loadVoices = () => {
       if (!window.speechSynthesis) return
       const voices = window.speechSynthesis.getVoices()
       setAvailableVoices(voices)
-      
-      const femaleVoice = voices.find(v => 
+
+      const femaleVoice = voices.find(v =>
         v.name.includes('Google UK English Female') ||
         v.name.includes('Samantha') ||
         v.name.includes('Zira')
       )
-      setSelectedVoice(femaleVoice || voices.find(v => v.lang === 'en-US') || voices[0] || null)
+      const currentVoice = femaleVoice || voices.find(v => v.lang === 'en-US') || voices[0] || null
+      setSelectedVoice(currentVoice)
     }
     if (window.speechSynthesis) {
       window.speechSynthesis.getVoices()
@@ -57,12 +80,12 @@ function App() {
       alert('Speech recognition architecture not supported in this browser pipeline.')
       return null
     }
-    
+
     const recognition = new SpeechRecognition()
     recognition.continuous = false
     recognition.interimResults = false
     recognition.lang = 'en-US'
-    
+
     recognition.onresult = async (event) => {
       const transcript = event.results[0][0].transcript
       setIsListening(false)
@@ -70,10 +93,10 @@ function App() {
         await transmitVoicePayload(transcript)
       }
     }
-    
+
     recognition.onerror = () => setIsListening(false)
     recognition.onend = () => setIsListening(false)
-    
+
     return recognition
   }
 
@@ -91,19 +114,19 @@ function App() {
     }
   }
 
+  // ⚡ FIX 1: Read voice directly from the mutable ref pointer
   const speakText = (text) => {
     if (!window.speechSynthesis) return
-    window.speechSynthesis.cancel()
     const utterance = new SpeechSynthesisUtterance(text)
     utterance.rate = 0.95
-    if (selectedVoice) utterance.voice = selectedVoice
+    if (selectedVoiceRef.current) utterance.voice = selectedVoiceRef.current
     window.speechSynthesis.speak(utterance)
   }
 
   const handleFileUpload = (e) => {
     const file = e.target.files[0]
     if (!file) return
-    
+
     setUploadedFile(file)
     const reader = new FileReader()
     reader.onload = (event) => {
@@ -113,20 +136,16 @@ function App() {
   }
 
   const transmitVoicePayload = async (spokenText) => {
-    console.log("🚀 TRANSMIT TRIGGERED WITH TEXT:", spokenText); // 👈 ADD THIS TEMPORARILY
+    console.log("🚀 TRANSMIT TRIGGERED WITH TEXT:", spokenText);
     const userMessage = { role: 'user', content: spokenText }
+    const updatedHistory = [...messagesRef.current, userMessage]
 
-  const transmitVoicePayload = async (spokenText) => {
-    const userMessage = { role: 'user', content: spokenText }
-    const updatedHistory = [...messages, userMessage]
-    
-    // 1. Immediately drop the user's message on the screen
-    // 2. Append an empty assistant string block as a placeholder for incoming stream tokens
     setMessages([...updatedHistory, { role: 'assistant', content: '' }])
     setIsLoading(true)
-    
+
+    if (window.speechSynthesis) window.speechSynthesis.cancel()
+
     try {
-      // Axios cannot map streams natively; fetch is required for network reader buffers
       const response = await fetch(`${import.meta.env.VITE_API_URL}/api/chat`, {
         method: 'POST',
         headers: {
@@ -134,43 +153,58 @@ function App() {
         },
         body: JSON.stringify({
           history: updatedHistory,
-          scenario: selectedScenario,
-          file_context: fileContent || null
+          scenario: scenarioRef.current,
+          file_context: fileContentRef.current || null
         })
       })
 
       if (!response.ok) throw new Error('Network stream breakdown.')
 
       const reader = response.body.getReader()
-      const decoder = new TextDecoder()
-      let done = false
-      let accumulatedText = ''
+      const decoder = new TextDecoder("utf-8")
+      let accumulatedText = '';
+      let spokenIndex = 0; 
 
-      // ⚡ Asynchronous chunk compilation pipeline
-      while (!done) {
-        const { value, done: doneReading } = await reader.read()
-        done = doneReading
-        
-        // Convert binary server network frames into human-readable text syllables
-        const chunkValue = decoder.decode(value)
-        accumulatedText += chunkValue
+      while (true) {
+        const { value, done } = await reader.read();
+        if (done) break;
 
-        // Mutate only the last array index to inject words in real-time
-        setMessages(prev => {
-          const streamHistory = [...prev]
-          if (streamHistory.length > 0 && streamHistory[streamHistory.length - 1].role === 'assistant') {
-            streamHistory[streamHistory.length - 1].content = accumulatedText
+        const chunk = decoder.decode(value, { stream: true });
+        accumulatedText += chunk;
+
+        setMessages((prev) => {
+          const updated = [...prev];
+          const lastIndex = updated.length - 1;
+          updated[lastIndex] = {
+            ...updated[lastIndex],
+            content: accumulatedText
+          };
+          return updated;
+        });
+
+        // ⚡ FIX 2: Nested loop instantly flushes multiple sentences found within a single packet
+        let printableText = accumulatedText.substring(spokenIndex);
+        let sentenceBoundary = printableText.search(/[.!?;]/);
+
+        while (sentenceBoundary !== -1) {
+          const completeSentence = printableText.substring(0, sentenceBoundary + 1).trim();
+          if (completeSentence.length > 0) {
+            speakText(completeSentence);
           }
-          return streamHistory
-        })
+          spokenIndex += sentenceBoundary + 1; 
+          printableText = accumulatedText.substring(spokenIndex);
+          sentenceBoundary = printableText.search(/[.!?;]/);
+        }
       }
 
-      // Execute vocal delivery once the final message layout blocks are fully stabilized
-      speakText(accumulatedText)
-      
+      const remainingText = accumulatedText.substring(spokenIndex).trim();
+      if (remainingText.length > 0) {
+        speakText(remainingText);
+      }
+
     } catch (error) {
       setMessages(prev => [
-        ...prev.slice(0, -1), // Purge empty stream placeholder row
+        ...prev.slice(0, -1), 
         { role: 'assistant', content: 'System error. Failed to map chunk stream transmission context.' }
       ])
     } finally {
@@ -194,7 +228,6 @@ function App() {
     }
   }
 
-  // TRACK 1 View-Mutation Method: Wipes SQLite profile context completely from backend memory agents
   const handleStartFresh = async () => {
     if (!window.confirm("CRITICAL WARNING: This action will completely purge the backend long-term vulnerability profile archive. Proceed?")) return
     setIsResetting(true)
@@ -219,7 +252,7 @@ function App() {
   return (
     <div className="min-h-screen bg-slate-950 text-slate-100 flex flex-col justify-between font-sans">
       <div className="max-w-6xl w-full mx-auto px-6 py-8 flex-1 flex flex-col">
-        
+
         {/* Header Layout */}
         <div className="flex flex-col md:flex-row justify-between items-start md:items-center border-b border-white/10 pb-4 mb-6 gap-4">
           <div>
@@ -228,9 +261,8 @@ function App() {
             </h1>
             <p className="text-xs text-slate-400">Zero-Typing Adaptive Response Simulator</p>
           </div>
-          
+
           <div className="flex flex-wrap items-center gap-3">
-            {/* TRACK 1 INTERFACE UPGRADE: The "Start Fresh" trigger panel */}
             <button
               onClick={handleStartFresh}
               disabled={isResetting}
@@ -252,10 +284,10 @@ function App() {
 
         {/* Workspace Matrix */}
         <div className="grid grid-cols-1 lg:grid-cols-3 gap-8 flex-1 items-stretch">
-          
+
           {/* Audio Interface Column */}
           <div className="lg:col-span-2 flex flex-col justify-between bg-white/[0.02] border border-white/5 rounded-2xl p-6">
-            
+
             <div className="space-y-4">
               {/* Active Settings */}
               <div className="grid grid-cols-2 sm:grid-cols-4 gap-3">
@@ -264,11 +296,10 @@ function App() {
                     key={key}
                     disabled={messages.length > 0}
                     onClick={() => setSelectedScenario(key)}
-                    className={`p-3 rounded-xl text-left border transition-all ${
-                      selectedScenario === key
-                        ? `bg-gradient-to-br ${sc.color} text-white border-transparent shadow-lg`
-                        : 'bg-white/5 text-slate-400 border-white/5 hover:bg-white/10 disabled:opacity-30'
-                    }`}
+                    className={`p-3 rounded-xl text-left border transition-all ${selectedScenario === key
+                      ? `bg-gradient-to-br ${sc.color} text-white border-transparent shadow-lg`
+                      : 'bg-white/5 text-slate-400 border-white/5 hover:bg-white/10 disabled:opacity-30'
+                      }`}
                   >
                     <div className="text-xs uppercase font-mono tracking-widest opacity-60">Role</div>
                     <div className="text-sm font-bold truncate">{sc.name}</div>
@@ -276,7 +307,7 @@ function App() {
                 ))}
               </div>
 
-              {/* TRACK 1 INTERFACE UPGRADE: Adversarial Voice Changer Dropdown */}
+              {/* Adversarial Voice Changer Dropdown */}
               <div className="bg-white/5 p-3 rounded-xl border border-white/5 flex flex-col sm:flex-row items-start sm:items-center justify-between gap-3">
                 <div>
                   <label className="block text-[10px] uppercase font-mono tracking-widest text-slate-400 font-semibold">
@@ -308,7 +339,7 @@ function App() {
             {/* Immersive Audio Visualizer Module */}
             <div className="my-auto py-12 flex flex-col items-center justify-center relative">
               <div className="w-48 h-48 flex items-center justify-center relative">
-                
+
                 {/* Visualizer Waves */}
                 <AnimatePresence>
                   {(isListening || isLoading) && (
@@ -331,11 +362,10 @@ function App() {
                 <button
                   onClick={toggleVoiceCapture}
                   disabled={isLoading || !!evaluation}
-                  className={`w-32 h-32 rounded-full flex flex-col items-center justify-center border transition-all z-10 relative shadow-2xl ${
-                    isListening 
-                      ? 'bg-red-600 border-transparent text-white' 
-                      : 'bg-slate-900 border-white/10 hover:border-yellow-400 text-slate-300'
-                  }`}
+                  className={`w-32 h-32 rounded-full flex flex-col items-center justify-center border transition-all z-10 relative shadow-2xl ${isListening
+                    ? 'bg-red-600 border-transparent text-white'
+                    : 'bg-slate-900 border-white/10 hover:border-yellow-400 text-slate-300'
+                    }`}
                 >
                   {isListening ? (
                     <div className="text-center">
@@ -364,6 +394,21 @@ function App() {
                 {isListening ? "Listening... Speak clearly now." : isLoading ? "Qwen generating strategic vocal output..." : "Channel closed. Tap to answer adversarial inquiry."}
               </p>
             </div>
+
+            {/* LIVE ADVERSARIAL TRANSCRIPT FEED */}
+            {messages.length > 0 && (
+              <div className="w-full mt-6 p-4 bg-slate-900/80 border border-white/10 rounded-xl min-h-[90px] max-h-[140px] overflow-y-auto font-mono text-xs text-left max-w-xl mx-auto shadow-inner group transition-all">
+                <div className="text-[10px] text-yellow-400 font-bold uppercase tracking-wider mb-1.5 flex justify-between items-center">
+                  <span>Active Feed: {messages[messages.length - 1].role === 'user' ? 'Investor Relations' : scenarios[selectedScenario].name.toUpperCase()}</span>
+                  {isLoading && <span className="w-1.5 h-1.5 bg-yellow-400 rounded-full animate-ping" />}
+                </div>
+                <p className="text-slate-200 leading-relaxed font-light">
+                  {messages[messages.length - 1].content || <span className="text-slate-500 italic animate-pulse">Initializing token transmission...</span>}
+                </p>
+
+                <div ref={chatEndRef} />
+              </div>
+            )}
 
             {/* Termination Trigger */}
             <div className="flex justify-end border-t border-white/5 pt-4">
@@ -403,7 +448,7 @@ function App() {
 
                 {evaluation && !isEvaluating && (
                   <motion.div initial={{ opacity: 0 }} animate={{ opacity: 1 }} className="space-y-5 mt-4 text-xs leading-relaxed">
-                    
+
                     {/* Metrics Progress bars */}
                     <div className="space-y-3 bg-white/5 p-3 rounded-xl border border-white/5">
                       {Object.entries(evaluation.breakdown).map(([metric, val]) => (

@@ -1,25 +1,30 @@
-from django.http import JsonResponse
-from django.http import StreamingHttpResponse  # ⚡ CRITICAL IMPORT
+from django.http import JsonResponse, StreamingHttpResponse
 from django.views.decorators.csrf import csrf_exempt
 from django.views.decorators.http import require_http_methods
 import json
 import os
-from openai import OpenAI
+from openai import OpenAI, AsyncOpenAI  # ⚡ UPGRADED TO ASYNC CLIENT
 from dotenv import load_dotenv
 from .models import UserMemory, GameSession
+from asgiref.sync import sync_to_async  # ⚡ Required for database calls in async views
 
 load_dotenv()
 
-# ALIBABA CLOUD MODEL STUDIO REGIONAL MIGRATION
 WORKSPACE_ID = os.getenv("QWEN_WORKSPACE_ID")
 BASE_URL_SINGAPORE = f"https://{WORKSPACE_ID}.ap-southeast-1.maas.aliyuncs.com/compatible-mode/v1"
 
+# ⚡ CLIENT 1: Async Client reserved for real-time text streaming
+async_client = AsyncOpenAI(
+    base_url=BASE_URL_SINGAPORE,
+    api_key=os.getenv("DASHSCOPE_API_KEY"),
+)
+
+# ⚡ CLIENT 2: Sync Client reserved for evaluation & database memory generation
 client = OpenAI(
     base_url=BASE_URL_SINGAPORE,
     api_key=os.getenv("DASHSCOPE_API_KEY"),
 )
 
-# Switch to the official flagship reasoning model recommended for complex tasks
 MODEL_NAME = "qwen3.7-max"
 
 SCENARIO_PROMPTS = {
@@ -55,9 +60,11 @@ Latest Session Mistake: {new_mistake}
 Return only the updated paragraph profile. Keep it under 4 sentences. Be direct, brutal, and concrete. Do not include introductory text or meta-commentary.
 """
 
-@csrf_exempt
-@require_http_methods(["POST"])
-def chat(request):
+# ⚡ NATIVE ASYNC VIEW (NO SYNC DECORATORS ATTACHED)
+async def chat(request):  
+    if request.method != "POST":
+        return JsonResponse({'error': 'Method not allowed'}, status=405)
+        
     try:
         data = json.loads(request.body)
         history = data.get('history', [])
@@ -67,7 +74,8 @@ def chat(request):
         if not history:
             return JsonResponse({'error': 'No conversation history provided'}, status=400)
 
-        profile, _ = UserMemory.objects.get_or_create(user_id="default_user")
+        # ⚡ Wrap database queries in sync_to_async
+        profile, _ = await sync_to_async(UserMemory.objects.get_or_create)(user_id="default_user")
         
         print("\n" + "="*50)
         print(f"🔮 [QWEN CLOUD STREAM] ACTIVE CONTEXT ATTACK PATH: {scenario.upper()}")
@@ -94,26 +102,31 @@ def chat(request):
         for msg in history:
             api_messages.append({"role": msg.get('role'), "content": msg.get('content')})
 
-        # ⚡ GENERATOR LAYER: Stream tokens directly out of the Qwen Cloud Core
-        def stream_generator():
-            response = client.chat.completions.create(
+        # ⚡ TRUE ASYNC GENERATOR LAYER
+        async def stream_generator():
+            response = await async_client.chat.completions.create(
                 model=MODEL_NAME,
                 messages=api_messages,
                 temperature=0.7,
                 max_tokens=150,
-                stream=True  # Instructs Alibaba Cloud to send text word-by-word
+                stream=True  
             )
-            for chunk in response:
+            async for chunk in response:  # ⚡ ASYNC FOR LOOP
                 if chunk.choices and chunk.choices[0].delta.content:
-                    yield chunk.choices[0].delta.content
+                    token = chunk.choices[0].delta.content
+                    print(token, end="", flush=True)  
+                    yield token.encode('utf-8')  
 
-        # Pipe the generator straight to the public internet network socket
-        response = StreamingHttpResponse(stream_generator(), content_type='text/event-stream')
-        response['X-Accel-Buffering'] = 'no'  # Prevents Nginx/proxy servers from buffering chunks
+        response = StreamingHttpResponse(stream_generator(), content_type='text/plain; charset=utf-8')
+        response['Cache-Control'] = 'no-cache'       
+        response['X-Accel-Buffering'] = 'no'          
         return response
 
     except Exception as e:
         return JsonResponse({'error': str(e)}, status=500)
+
+# ⚡ EXPLICITLY INJECT CSRF EXEMPTION WITHOUT WRAPPING THE COROUTINE FUNCTIONS
+chat.csrf_exempt = True
 
 
 @csrf_exempt
