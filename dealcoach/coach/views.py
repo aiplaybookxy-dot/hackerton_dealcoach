@@ -1,4 +1,5 @@
 from django.http import JsonResponse
+from django.http import StreamingHttpResponse  # ⚡ CRITICAL IMPORT
 from django.views.decorators.csrf import csrf_exempt
 from django.views.decorators.http import require_http_methods
 import json
@@ -69,8 +70,7 @@ def chat(request):
         profile, _ = UserMemory.objects.get_or_create(user_id="default_user")
         
         print("\n" + "="*50)
-        print(f"🔮 [QWEN CLOUD AGENT] INITIALIZING INTERACTION FOR SCENARIO: {scenario.upper()}")
-        print(f"ACTIVE REASONING CONTEXT: {profile.vulnerability_profile}")
+        print(f"🔮 [QWEN CLOUD STREAM] ACTIVE CONTEXT ATTACK PATH: {scenario.upper()}")
         print("="*50 + "\n")
         
         base_prompt = SCENARIO_PROMPTS.get(scenario, SCENARIO_PROMPTS['vc'])
@@ -94,14 +94,24 @@ def chat(request):
         for msg in history:
             api_messages.append({"role": msg.get('role'), "content": msg.get('content')})
 
-        response = client.chat.completions.create(
-            model=MODEL_NAME,
-            messages=api_messages,
-            temperature=0.7,
-            max_tokens=150
-        )
-        
-        return JsonResponse({'reply': response.choices[0].message.content})
+        # ⚡ GENERATOR LAYER: Stream tokens directly out of the Qwen Cloud Core
+        def stream_generator():
+            response = client.chat.completions.create(
+                model=MODEL_NAME,
+                messages=api_messages,
+                temperature=0.7,
+                max_tokens=150,
+                stream=True  # Instructs Alibaba Cloud to send text word-by-word
+            )
+            for chunk in response:
+                if chunk.choices and chunk.choices[0].delta.content:
+                    yield chunk.choices[0].delta.content
+
+        # Pipe the generator straight to the public internet network socket
+        response = StreamingHttpResponse(stream_generator(), content_type='text/event-stream')
+        response['X-Accel-Buffering'] = 'no'  # Prevents Nginx/proxy servers from buffering chunks
+        return response
+
     except Exception as e:
         return JsonResponse({'error': str(e)}, status=500)
 

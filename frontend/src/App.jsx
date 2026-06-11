@@ -116,25 +116,59 @@ function App() {
     const userMessage = { role: 'user', content: spokenText }
     const updatedHistory = [...messages, userMessage]
     
-    setMessages(updatedHistory)
+    // 1. Immediately drop the user's message on the screen
+    // 2. Append an empty assistant string block as a placeholder for incoming stream tokens
+    setMessages([...updatedHistory, { role: 'assistant', content: '' }])
     setIsLoading(true)
     
     try {
-      const response = await axios.post(`${import.meta.env.VITE_API_URL}/api/chat`, {
-        history: updatedHistory,
-        scenario: selectedScenario,
-        file_context: fileContent || null
+      // Axios cannot map streams natively; fetch is required for network reader buffers
+      const response = await fetch(`${import.meta.env.VITE_API_URL}/api/chat`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+          history: updatedHistory,
+          scenario: selectedScenario,
+          file_context: fileContent || null
+        })
       })
-      
-      const aiMessage = { role: 'assistant', content: response.data.reply }
-      setMessages(prev => [...prev, aiMessage])
-      speakText(response.data.reply)
+
+      if (!response.ok) throw new Error('Network stream breakdown.')
+
+      const reader = response.body.getReader()
+      const decoder = new TextDecoder()
+      let done = false
+      let accumulatedText = ''
+
+      // ⚡ Asynchronous chunk compilation pipeline
+      while (!done) {
+        const { value, done: doneReading } = await reader.read()
+        done = doneReading
+        
+        // Convert binary server network frames into human-readable text syllables
+        const chunkValue = decoder.decode(value)
+        accumulatedText += chunkValue
+
+        // Mutate only the last array index to inject words in real-time
+        setMessages(prev => {
+          const streamHistory = [...prev]
+          if (streamHistory.length > 0 && streamHistory[streamHistory.length - 1].role === 'assistant') {
+            streamHistory[streamHistory.length - 1].content = accumulatedText
+          }
+          return streamHistory
+        })
+      }
+
+      // Execute vocal delivery once the final message layout blocks are fully stabilized
+      speakText(accumulatedText)
       
     } catch (error) {
-      setMessages(prev => [...prev, { 
-        role: 'assistant', 
-        content: 'System error. Failed to map transmission context.' 
-      }])
+      setMessages(prev => [
+        ...prev.slice(0, -1), // Purge empty stream placeholder row
+        { role: 'assistant', content: 'System error. Failed to map chunk stream transmission context.' }
+      ])
     } finally {
       setIsLoading(false)
     }
