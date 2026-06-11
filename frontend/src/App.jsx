@@ -113,6 +113,10 @@ function App() {
   }
 
   const transmitVoicePayload = async (spokenText) => {
+    console.log("🚀 TRANSMIT TRIGGERED WITH TEXT:", spokenText); // 👈 ADD THIS TEMPORARILY
+    const userMessage = { role: 'user', content: spokenText }
+
+  const transmitVoicePayload = async (spokenText) => {
     const userMessage = { role: 'user', content: spokenText }
     const updatedHistory = [...messages, userMessage]
     
